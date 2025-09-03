@@ -4,7 +4,7 @@ Summary:
 2. This implementation based on StyleGan1 papers;
 3. This implementation should train for an appropriate time
 """
-
+import math
 import os
 import random
 
@@ -53,21 +53,6 @@ def accumulate(model1, model2, decay=0.999):
         buf1[k].data.copy_(buf2[k].data)
 
 
-class MappingNetwork(nn.Module):
-    def __init__(self, z_dim=512, w_dim=512, num_layers=8):
-        super().__init__()
-        layers = []
-        for i in range(num_layers):
-            in_dim = z_dim if i == 0 else w_dim
-            layers.append(nn.Linear(in_dim, w_dim))
-            layers.append(nn.LeakyReLU(0.2))
-        self.mapping = nn.Sequential(*layers)
-
-    def forward(self, z):
-        z = z / (z.norm(dim=1, keepdim=True) + 1e-8)
-        return self.mapping(z)
-
-
 def style_mixing(mapping_network, z1, z2, num_blocks, prob=0.9):
     w1 = mapping_network(z1)
     w2 = mapping_network(z2)
@@ -79,45 +64,68 @@ def style_mixing(mapping_network, z1, z2, num_blocks, prob=0.9):
     return [w1.clone() for _ in range(cutoff)] + [w2.clone() for _ in range(num_blocks - cutoff)]
 
 
-# -----------------------
-# Adaptive Instance Norm
-# -----------------------
-class AdaIN(nn.Module):
-    def __init__(self, channels, dlatent_dim=512):
+# ---------------- Equalized Linear ---------------- #
+class EqualizedLinear(nn.Module):
+    def __init__(self, in_dim, out_dim, lr_mul=1.0):
         super().__init__()
-        self.norm = nn.InstanceNorm2d(channels)
-        self.style_scale = nn.Linear(dlatent_dim, channels)
-        self.style_bias = nn.Linear(dlatent_dim, channels)
+        self.weight = nn.Parameter(torch.randn(out_dim, in_dim) / lr_mul)
+        self.bias = nn.Parameter(torch.zeros(out_dim))
+        self.scale = (1 / math.sqrt(in_dim)) * lr_mul
+        self.lr_mul = lr_mul
 
-    def forward(self, x, w):
-        x = self.norm(x)
-        style_scale = self.style_scale(w).unsqueeze(2).unsqueeze(3)
-        style_bias = self.style_bias(w).unsqueeze(2).unsqueeze(3)
-        return style_scale * x + style_bias
+    def forward(self, x):
+        return F.linear(x, self.weight * self.scale, self.bias * self.lr_mul)
 
 
-# -----------------------
-# Styled Conv Block
-# -----------------------
+# ---------------- PixelNorm ---------------- #
+class PixelNorm(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, x, eps=1e-8):
+        return x / torch.sqrt(torch.mean(x ** 2, dim=1, keepdim=True) + eps)
+
+
+# ---------------- Mapping Network ---------------- #
+class MappingNetwork(nn.Module):
+    def __init__(self, z_dim=512, w_dim=512, num_layers=8):
+        super().__init__()
+        layers = []
+        for i in range(num_layers):
+            in_dim = z_dim if i == 0 else w_dim
+            layers.append(EqualizedLinear(in_dim, w_dim))
+            layers.append(nn.LeakyReLU(0.2))
+            layers.append(PixelNorm())
+        self.mapping = nn.Sequential(*layers)
+
+    def forward(self, z):
+        z = z / (z.norm(dim=1, keepdim=True) + 1e-8)  # normalize latent
+        return self.mapping(z)
+
+
+# ---------------- Styled Conv Block ---------------- #
 class StyledConvBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, dlatent_dim=512):
+    def __init__(self, in_channels, out_channels, dlatent_dim):
         super().__init__()
         self.conv = nn.Conv2d(in_channels, out_channels, 3, padding=1)
-        self.adain = AdaIN(out_channels, dlatent_dim)
-        self.noise_strength = nn.Parameter(torch.zeros(out_channels))
+        self.style = EqualizedLinear(dlatent_dim, out_channels)
+        self.noise_weight = nn.Parameter(torch.zeros(1, out_channels, 1, 1))
+        self.act = nn.LeakyReLU(0.2)
 
     def forward(self, x, w, noise=None):
-        x = self.conv(x)
+        # Style modulation (scale feature maps)
+        style = self.style(w).unsqueeze(2).unsqueeze(3)
+        x = self.conv(x) * (style + 1)
+
+        # Add noise
         if noise is None:
-            noise = torch.randn(x.size(0), 1, x.size(2), x.size(3), device=x.device)
-        x = x + self.noise_strength.view(1, -1, 1, 1) * noise
-        x = self.adain(x, w)
-        return F.leaky_relu(x, 0.2)
+            noise = torch.randn_like(x)
+        x = x + self.noise_weight * noise
+
+        return self.act(x)
 
 
-# -----------------------
-# Generator (fixed 128x128)
-# -----------------------
+# ---------------- Generator (StyleGAN1) ---------------- #
 class Generator(nn.Module):
     def __init__(self, dlatent_dim=512, base_channels=64):
         super().__init__()
@@ -128,7 +136,7 @@ class Generator(nn.Module):
             StyledConvBlock(base_channels * 16, base_channels * 8, dlatent_dim),
             StyledConvBlock(base_channels * 8, base_channels * 4, dlatent_dim),
             StyledConvBlock(base_channels * 4, base_channels * 2, dlatent_dim),
-            StyledConvBlock(base_channels * 2, base_channels, dlatent_dim),
+            StyledConvBlock(base_channels * 2, base_channels, dlatent_dim)
         ])
 
         self.to_rgb = nn.Conv2d(base_channels, 3, 1)
@@ -136,6 +144,7 @@ class Generator(nn.Module):
     def forward(self, w_list, noise_list=None):
         batch_size = w_list[0].size(0)
         x = self.const_input.repeat(batch_size, 1, 1, 1)
+
         if noise_list is None:
             noise_list = [None] * len(self.blocks)
 
